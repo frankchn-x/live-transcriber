@@ -376,9 +376,18 @@ final class TranscriptionEngine: ObservableObject {
     // 改为每句话先用独立检测，en 之外一律按 zh 解码（zh 解码英文语音仍输出英文原文，反向则会翻译）
     private var utteranceLang: String?
 
+    // iPhone 用量化版（更小、编译更快、内存占用更低）；Mac 用完整版
+    nonisolated static var whisperVariant: String {
+        #if os(iOS)
+        return "large-v3_turbo_954"
+        #else
+        return "large-v3_turbo"
+        #endif
+    }
+
     nonisolated static var whisperModelDownloaded: Bool {
         let folder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("huggingface/models/argmaxinc/whisperkit-coreml/openai_whisper-large-v3_turbo")
+            .appendingPathComponent("huggingface/models/argmaxinc/whisperkit-coreml/openai_whisper-\(whisperVariant)")
         return FileManager.default.fileExists(atPath: folder.appendingPathComponent("TextDecoder.mlmodelc").path)
     }
 
@@ -390,13 +399,13 @@ final class TranscriptionEngine: ObservableObject {
             Task { @MainActor in self?.downloadProgress = fraction }
         }
         do {
-            status = "正在下载 Whisper 识别模型（约 1.6GB，仅首次）…"
-            _ = try await WhisperKit.download(variant: "large-v3_turbo", progressCallback: onProgress)
+            status = "正在下载 Whisper 识别模型（约 1GB，仅首次）…"
+            _ = try await WhisperKit.download(variant: Self.whisperVariant, progressCallback: onProgress)
         } catch {
             // 国内网络直连 HuggingFace 常失败，自动切换镜像源重试
             status = "官方源连接失败，改用国内镜像下载…"
             _ = try await WhisperKit.download(
-                variant: "large-v3_turbo",
+                variant: Self.whisperVariant,
                 endpoint: "https://hf-mirror.com",
                 progressCallback: onProgress
             )
@@ -410,7 +419,7 @@ final class TranscriptionEngine: ObservableObject {
         }
         status = "正在加载 Whisper 模型（首次需编译优化，可能要几分钟）…"
         let config = WhisperKitConfig(
-            model: "large-v3_turbo",
+            model: Self.whisperVariant,
             verbose: false,
             logLevel: .error,
             prewarm: true
