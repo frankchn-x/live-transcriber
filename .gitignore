@@ -1,3 +1,6 @@
 .build/
 dist/
 .DS_Store
+
+# xcodegen 生成物(由 project.yml 复现)
+*.xcodeproj

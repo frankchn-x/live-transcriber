@@ -61,7 +61,7 @@ struct ContentView: View {
     @StateObject private var engine = TranscriptionEngine()
     @AppStorage("appleLocaleID") private var localeID = "zh-CN"
     @AppStorage("backend") private var backendID = "whisper"
-    @AppStorage("interpreterMode") private var interpreterMode = false
+    @AppStorage("interpreterMode") private var interpreterMode = true
     @AppStorage("englishVoiceID") private var englishVoiceID = ""
     @State private var englishVoices: [AVSpeechSynthesisVoice] = []
     @State private var translationConfig: TranslationSession.Configuration?
@@ -73,6 +73,10 @@ struct ContentView: View {
     @State private var copied = false
     @State private var showWhisperDownloadPrompt = false
     @State private var showFontSettings = false
+    @State private var showHistory = false
+    @State private var obsidianDone = false
+    @State private var exportError: String?
+    @AppStorage("obsidianVaultPath") private var obsidianVaultPath = ""
     @AppStorage("transcriptFontID") private var transcriptFontID = "system"
     @AppStorage("transcriptFontSize") private var transcriptFontSize = 14.0
     @AppStorage("appearanceMode") private var appearanceMode = "auto"
@@ -109,10 +113,13 @@ struct ContentView: View {
         .translationTask(translationConfig) { session in
             translationSession = session
             try? await session.prepareTranslation()
+            // 会话就绪后补翻启动初期被跳过的段落
+            translateNewSegments()
         }
         .translationTask(zhEnConfig) { session in
             zhEnSession = session
             try? await session.prepareTranslation()
+            translateNewSegments()
         }
         .onChange(of: engine.segments.count) { _, _ in
             translateNewSegments()
@@ -158,6 +165,18 @@ struct ContentView: View {
                 }
             }
             Spacer(minLength: 20)
+
+            Button {
+                showHistory = true
+            } label: {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .buttonStyle(.bordered)
+            .help("历史转录记录")
+            .sheet(isPresented: $showHistory) {
+                HistoryView()
+            }
 
             Button {
                 showFontSettings.toggle()
@@ -300,6 +319,33 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
                     .help("在 Finder 中显示已保存的 Markdown")
+
+                    Button {
+                        do {
+                            try Obsidian.export(file: url, customPath: obsidianVaultPath)
+                            obsidianDone = true
+                            Task {
+                                try? await Task.sleep(for: .seconds(2))
+                                obsidianDone = false
+                            }
+                        } catch {
+                            exportError = error.localizedDescription
+                        }
+                    } label: {
+                        Image(systemName: obsidianDone ? "checkmark.circle.fill" : "tray.and.arrow.up")
+                            .font(.system(size: 14))
+                            .foregroundStyle(obsidianDone ? AnyShapeStyle(.green) : AnyShapeStyle(.secondary))
+                    }
+                    .buttonStyle(.plain)
+                    .help("存入 Obsidian 并打开")
+                    .alert("导出失败", isPresented: Binding(
+                        get: { exportError != nil },
+                        set: { if !$0 { exportError = nil } }
+                    )) {
+                        Button("好", role: .cancel) {}
+                    } message: {
+                        Text(exportError ?? "")
+                    }
                 }
                 Button {
                     NSPasteboard.general.clearContents()
@@ -444,6 +490,236 @@ func voiceLabel(_ v: AVSpeechSynthesisVoice) -> String {
     return "\(v.name)（\(region)\(quality)）"
 }
 
+// MARK: - Obsidian 导出
+
+enum Obsidian {
+    struct ExportError: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+
+    // 优先使用手动指定的库路径；否则从 Obsidian 配置里找当前打开的库
+    static func vaultURL(customPath: String) -> URL? {
+        if !customPath.isEmpty {
+            return URL(fileURLWithPath: customPath)
+        }
+        let cfg = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/obsidian/obsidian.json")
+        guard let data = try? Data(contentsOf: cfg),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let vaults = json["vaults"] as? [String: [String: Any]] else { return nil }
+        let entries = Array(vaults.values)
+        if let open = entries.first(where: { ($0["open"] as? Bool) == true }),
+           let path = open["path"] as? String {
+            return URL(fileURLWithPath: path)
+        }
+        let newest = entries.max { (($0["ts"] as? Double) ?? 0) < (($1["ts"] as? Double) ?? 0) }
+        guard let path = newest?["path"] as? String else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    @discardableResult
+    static func export(file: URL, customPath: String) throws -> URL {
+        guard let vault = vaultURL(customPath: customPath) else {
+            throw ExportError(message: "未找到 Obsidian 库：请先安装并打开过 Obsidian，或在设置里手动选择库目录")
+        }
+        let dir = vault.appendingPathComponent("实时转录", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent(file.lastPathComponent)
+        if FileManager.default.fileExists(atPath: dest.path) {
+            try FileManager.default.removeItem(at: dest)
+        }
+        try FileManager.default.copyItem(at: file, to: dest)
+        openInObsidian(dest: dest, vault: vault)
+        return dest
+    }
+
+    static func openInObsidian(dest: URL, vault: URL) {
+        var comps = URLComponents()
+        comps.scheme = "obsidian"
+        comps.host = "open"
+        comps.queryItems = [
+            URLQueryItem(name: "vault", value: vault.lastPathComponent),
+            URLQueryItem(name: "file", value: "实时转录/" + dest.deletingPathExtension().lastPathComponent),
+        ]
+        if let url = comps.url {
+            NSWorkspace.shared.open(url)
+        }
+    }
+}
+
+// MARK: - 历史记录
+
+struct HistoryView: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("obsidianVaultPath") private var obsidianVaultPath = ""
+    @State private var files: [URL] = []
+    @State private var selected: URL?
+    @State private var content = ""
+    @State private var feedback: String?
+    @State private var confirmDelete = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("历史记录")
+                    .font(.system(size: 14, weight: .semibold))
+                Text("\(files.count) 条")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Button("完成") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            Divider()
+            if files.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "tray")
+                        .font(.system(size: 32, weight: .light))
+                        .foregroundStyle(.tertiary)
+                    Text("还没有转录记录")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                HSplitView {
+                    List(selection: $selected) {
+                        ForEach(files, id: \.self) { url in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(title(for: url))
+                                    .font(.system(size: 13, weight: .medium))
+                                Text(subtitle(for: url))
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 2)
+                            .tag(url)
+                        }
+                    }
+                    .frame(minWidth: 210, idealWidth: 230, maxWidth: 300)
+                    detail
+                }
+            }
+        }
+        .frame(width: 780, height: 520)
+        .onAppear { reload() }
+        .onChange(of: selected) { _, _ in
+            feedback = nil
+            loadContent()
+        }
+        .confirmationDialog("确定删除这条转录记录？该操作不可撤销。", isPresented: $confirmDelete) {
+            Button("删除", role: .destructive) { deleteSelected() }
+        }
+    }
+
+    private var detail: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                Text(content)
+                    .font(.system(size: 12.5))
+                    .lineSpacing(3)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
+            }
+            Divider()
+            HStack(spacing: 10) {
+                if let feedback {
+                    Text(feedback)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Button("在 Finder 中显示") {
+                    if let selected {
+                        NSWorkspace.shared.activateFileViewerSelecting([selected])
+                    }
+                }
+                Button("复制") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(content, forType: .string)
+                    feedback = "已复制"
+                }
+                Button("存入 Obsidian") {
+                    guard let selected else { return }
+                    do {
+                        try Obsidian.export(file: selected, customPath: obsidianVaultPath)
+                        feedback = "已存入 Obsidian 并打开"
+                    } catch {
+                        feedback = error.localizedDescription
+                    }
+                }
+                Button(role: .destructive) {
+                    confirmDelete = true
+                } label: {
+                    Text("删除")
+                }
+            }
+            .controlSize(.small)
+            .padding(10)
+        }
+    }
+
+    private func reload() {
+        let dir = TranscriptionEngine.transcriptsDirectory
+        let items = (try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]
+        )) ?? []
+        files = items.filter { $0.pathExtension == "md" }
+            .sorted { (modified($0) ?? .distantPast) > (modified($1) ?? .distantPast) }
+        if selected == nil || !files.contains(selected!) {
+            selected = files.first
+        }
+        loadContent()
+    }
+
+    private func modified(_ url: URL) -> Date? {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+    }
+
+    private func loadContent() {
+        guard let selected else {
+            content = ""
+            return
+        }
+        content = (try? String(contentsOf: selected, encoding: .utf8)) ?? ""
+    }
+
+    private func deleteSelected() {
+        guard let selected else { return }
+        try? FileManager.default.removeItem(at: selected)
+        self.selected = nil
+        reload()
+    }
+
+    private func title(for url: URL) -> String {
+        // 转录_2026-06-12_183005 → 2026-06-12 18:30
+        let name = url.deletingPathExtension().lastPathComponent
+        let parts = name.split(separator: "_")
+        if parts.count >= 3, parts[2].count >= 4 {
+            let t = parts[2]
+            let hh = t.prefix(2), mm = t.dropFirst(2).prefix(2)
+            return "\(parts[1]) \(hh):\(mm)"
+        }
+        return name
+    }
+
+    private func subtitle(for url: URL) -> String {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        let kb = max(1, size / 1024)
+        if let d = modified(url) {
+            let f = DateFormatter()
+            f.dateFormat = "MM-dd HH:mm"
+            return "\(kb) KB · 修改于 \(f.string(from: d))"
+        }
+        return "\(kb) KB"
+    }
+}
+
 // MARK: - 组件
 
 struct SettingsView: View {
@@ -451,12 +727,13 @@ struct SettingsView: View {
     let voices: [AVSpeechSynthesisVoice]
     @AppStorage("backend") private var backendID = "whisper"
     @AppStorage("appleLocaleID") private var localeID = "zh-CN"
-    @AppStorage("interpreterMode") private var interpreterMode = false
+    @AppStorage("interpreterMode") private var interpreterMode = true
     @AppStorage("englishVoiceID") private var englishVoiceID = ""
     @AppStorage("transcriptFontID") private var fontID = "system"
     @AppStorage("transcriptFontSize") private var fontSize = 14.0
     @AppStorage("transcriptColorHex") private var colorHex = ""
     @AppStorage("appearanceMode") private var appearanceMode = "auto"
+    @AppStorage("obsidianVaultPath") private var obsidianVaultPath = ""
     @Environment(\.colorScheme) private var colorScheme
 
     private var colorBinding: Binding<Color> {
@@ -464,6 +741,13 @@ struct SettingsView: View {
             get: { Color(hex: colorHex) ?? .primary },
             set: { colorHex = $0.hexString }
         )
+    }
+
+    private var vaultDisplayName: String {
+        if let vault = Obsidian.vaultURL(customPath: obsidianVaultPath) {
+            return vault.lastPathComponent + (obsidianVaultPath.isEmpty ? "（自动）" : "")
+        }
+        return "未检测到 Obsidian 库"
     }
 
     var body: some View {
@@ -561,6 +845,33 @@ struct SettingsView: View {
                     fontID = "system"
                     fontSize = 14
                     colorHex = ""
+                }
+                .controlSize(.small)
+            }
+
+            Divider()
+
+            sectionTitle("导出")
+            row("Obsidian") {
+                Text(vaultDisplayName)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if !obsidianVaultPath.isEmpty {
+                    Button("自动") { obsidianVaultPath = "" }
+                        .controlSize(.small)
+                        .help("恢复自动检测当前打开的 Obsidian 库")
+                }
+                Button("选择…") {
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = true
+                    panel.canChooseFiles = false
+                    panel.prompt = "选择 Obsidian 库目录"
+                    if panel.runModal() == .OK, let url = panel.url {
+                        obsidianVaultPath = url.path
+                    }
                 }
                 .controlSize(.small)
             }

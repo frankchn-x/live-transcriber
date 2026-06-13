@@ -1,0 +1,43 @@
+name: LiveTranscriberiOS
+options:
+  bundleIdPrefix: com.frank
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+
+packages:
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit
+    from: 0.9.0
+
+targets:
+  LiveTranscriber:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/iOS
+      - path: Sources/App/TranscriptionEngine.swift   # 与 macOS 共享的核心引擎
+    dependencies:
+      - package: WhisperKit
+    info:
+      path: Sources/iOS/Info.plist
+      properties:
+        CFBundleDisplayName: 实时转录
+        CFBundleShortVersionString: "1.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIFileSharingEnabled: true                     # 让「文件」App 能看到转录记录
+        LSSupportsOpeningDocumentsInPlace: true
+        NSMicrophoneUsageDescription: 需要使用麦克风对现场对话进行实时转录。
+        NSSpeechRecognitionUsageDescription: 需要语音识别将对话转成文字。
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frank.livetranscriber
+        MARKETING_VERSION: "1.1.0"
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"                   # iPhone + iPad
+        GENERATE_INFOPLIST_FILE: NO

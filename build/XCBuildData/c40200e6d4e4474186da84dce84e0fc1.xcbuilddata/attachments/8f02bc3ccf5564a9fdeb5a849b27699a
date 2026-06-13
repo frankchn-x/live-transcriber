@@ -1,0 +1,4 @@
+module ArgmaxCore {
+header "ArgmaxCore-Swift.h"
+export *
+}

@@ -76,13 +76,19 @@ final class VoiceBuffer: @unchecked Sendable {
     }
 }
 
-// 播报英文期间用于屏蔽麦克风输入，避免喇叭声音被识别造成回声循环
+// 播报英文期间用于屏蔽麦克风输入（仅在系统回声消除不可用时启用）
 final class MicGate: @unchecked Sendable {
     private let lock = NSLock()
     private var _muted = false
+    private var _aecActive = false
     var muted: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _muted }
         set { lock.lock(); _muted = newValue; lock.unlock() }
+    }
+    // 系统回声消除已开启时不再静音收音
+    var aecActive: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _aecActive }
+        set { lock.lock(); _aecActive = newValue; lock.unlock() }
     }
 }
 
@@ -112,6 +118,14 @@ final class EnglishSpeaker: NSObject, AVSpeechSynthesizerDelegate {
     func preview(_ text: String) {
         stop()
         speak(text)
+    }
+
+    // 静音念一个词把音色加载进内存，消除首次真实播报的载入延迟
+    func warmUp() {
+        let utterance = AVSpeechUtterance(string: "Hi")
+        utterance.voice = voice
+        utterance.volume = 0
+        synthesizer.speak(utterance)
     }
 
     func stop() {
@@ -158,9 +172,51 @@ final class TranscriptionEngine: ObservableObject {
     private let voiceBuffer = VoiceBuffer()
     private var whisperLoop: Task<Void, Never>?
 
+    private var rebuildTap: (() -> Void)?
+    private var configRestoreTask: Task<Void, Never>?
+
     init() {
         speaker.onSpeakingChanged = { [micGate] speaking in
-            micGate.muted = speaking
+            micGate.muted = speaking && !micGate.aecActive
+        }
+        // 蓝牙耳机连接/断开等设备变化会让音频引擎停摆，监听后自动恢复
+        NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: audioEngine,
+            queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleConfigurationChange() }
+        }
+    }
+
+    // 注：系统语音处理 setVoiceProcessingEnabled 需要引擎输出端同时运行才会触发输入回调，
+    // 而我们用独立的 AVSpeechSynthesizer 播放，启用后麦克风只会收到静音。故关闭它，
+    // 改用 micGate 在播报期间静音收音来防回声（aecActive=false）。
+    private func disableVoiceProcessing() {
+        let input = audioEngine.inputNode
+        if input.isVoiceProcessingEnabled {
+            try? input.setVoiceProcessingEnabled(false)
+        }
+        micGate.aecActive = false
+    }
+
+    private func handleConfigurationChange() {
+        guard isRunning else { return }
+        configRestoreTask?.cancel()
+        configRestoreTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard let self, !Task.isCancelled, self.isRunning else { return }
+            self.status = "检测到音频设备变化，正在恢复…"
+            self.audioEngine.stop()
+            self.audioEngine.inputNode.removeTap(onBus: 0)
+            self.rebuildTap?()
+            self.audioEngine.prepare()
+            do {
+                try self.audioEngine.start()
+                self.status = self.backend == .whisper ? "正在聆听…（Whisper · 中英自动识别）" : "正在聆听…"
+            } catch {
+                self.status = "设备切换后麦克风恢复失败：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -174,6 +230,9 @@ final class TranscriptionEngine: ObservableObject {
 
     func setEnglishVoice(identifier: String) {
         speaker.voiceIdentifier = identifier.isEmpty ? nil : identifier
+        if !isRunning {
+            speaker.warmUp()
+        }
     }
 
     func start(localeID: String, backend: Backend) async {
@@ -185,9 +244,18 @@ final class TranscriptionEngine: ObservableObject {
 
         let granted = await AVCaptureDevice.requestAccess(for: .audio)
         guard granted else {
-            status = "麦克风权限被拒绝：请在 系统设置 > 隐私与安全性 > 麦克风 中开启"
+            status = "麦克风权限被拒绝：请在系统设置中开启麦克风权限"
             return
         }
+
+        #if os(iOS)
+        do {
+            try configureAudioSession()
+        } catch {
+            status = "音频会话启动失败：\(error.localizedDescription)"
+            return
+        }
+        #endif
 
         switch backend {
         case .apple:
@@ -196,6 +264,20 @@ final class TranscriptionEngine: ObservableObject {
             await startWhisper()
         }
     }
+
+    #if os(iOS)
+    // iOS 必须显式配置音频会话才能边录边放；.defaultToSpeaker 让英文播报走扬声器
+    private func configureAudioSession() throws {
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playAndRecord, mode: .default,
+                                options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
+        try session.setActive(true)
+    }
+
+    private func deactivateAudioSession() {
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+    #endif
 
     private func startApple(localeID: String) async {
         let locale = Locale(identifier: localeID)
@@ -258,25 +340,28 @@ final class TranscriptionEngine: ObservableObject {
             return
         }
 
-        let input = audioEngine.inputNode
-        let micFormat = input.outputFormat(forBus: 0)
-        guard let converter = AVAudioConverter(from: micFormat, to: analyzerFormat) else {
-            status = "音频格式转换器创建失败"
-            return
-        }
-        let gate = micGate
-        input.installTap(onBus: 0, bufferSize: 4096, format: micFormat) { [weak self] buffer, _ in
-            if gate.muted { return }
-            self?.reportLevel(from: buffer)
-            if let converted = Self.convert(buffer, using: converter, to: analyzerFormat) {
-                continuation.yield(AnalyzerInput(buffer: converted))
+        disableVoiceProcessing()
+        rebuildTap = { [weak self] in
+            guard let self else { return }
+            let input = self.audioEngine.inputNode
+            let micFormat = input.outputFormat(forBus: 0)
+            guard micFormat.sampleRate > 0,
+                  let converter = AVAudioConverter(from: micFormat, to: analyzerFormat) else { return }
+            let gate = self.micGate
+            input.installTap(onBus: 0, bufferSize: 4096, format: micFormat) { [weak self] buffer, _ in
+                if gate.muted { return }
+                self?.reportLevel(from: buffer)
+                if let converted = Self.convert(buffer, using: converter, to: analyzerFormat) {
+                    continuation.yield(AnalyzerInput(buffer: converted))
+                }
             }
         }
+        rebuildTap?()
         audioEngine.prepare()
         do {
             try audioEngine.start()
         } catch {
-            input.removeTap(onBus: 0)
+            audioEngine.inputNode.removeTap(onBus: 0)
             status = "麦克风启动失败：\(error.localizedDescription)"
             return
         }
@@ -353,26 +438,29 @@ final class TranscriptionEngine: ObservableObject {
 
         voiceBuffer.reset()
         utteranceLang = nil
-        let input = audioEngine.inputNode
-        let micFormat = input.outputFormat(forBus: 0)
-        guard let converter = AVAudioConverter(from: micFormat, to: whisperFormat) else {
-            status = "音频格式转换器创建失败"
-            return
+        disableVoiceProcessing()
+        rebuildTap = { [weak self] in
+            guard let self else { return }
+            let input = self.audioEngine.inputNode
+            let micFormat = input.outputFormat(forBus: 0)
+            guard micFormat.sampleRate > 0,
+                  let converter = AVAudioConverter(from: micFormat, to: whisperFormat) else { return }
+            let gate = self.micGate
+            let vb = self.voiceBuffer
+            input.installTap(onBus: 0, bufferSize: 4096, format: micFormat) { [weak self] buffer, _ in
+                if gate.muted { return }
+                self?.reportLevel(from: buffer)
+                guard let converted = Self.convert(buffer, using: converter, to: whisperFormat),
+                      let ch = converted.floatChannelData else { return }
+                vb.ingest(Array(UnsafeBufferPointer(start: ch[0], count: Int(converted.frameLength))))
+            }
         }
-        let gate = micGate
-        let vb = voiceBuffer
-        input.installTap(onBus: 0, bufferSize: 4096, format: micFormat) { [weak self] buffer, _ in
-            if gate.muted { return }
-            self?.reportLevel(from: buffer)
-            guard let converted = Self.convert(buffer, using: converter, to: whisperFormat),
-                  let ch = converted.floatChannelData else { return }
-            vb.ingest(Array(UnsafeBufferPointer(start: ch[0], count: Int(converted.frameLength))))
-        }
+        rebuildTap?()
         audioEngine.prepare()
         do {
             try audioEngine.start()
         } catch {
-            input.removeTap(onBus: 0)
+            audioEngine.inputNode.removeTap(onBus: 0)
             status = "麦克风启动失败：\(error.localizedDescription)"
             return
         }
@@ -380,11 +468,11 @@ final class TranscriptionEngine: ObservableObject {
         var lastInterimDuration = 0.0
         whisperLoop = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 700_000_000)
+                try? await Task.sleep(nanoseconds: 250_000_000)
                 guard let self, !Task.isCancelled else { return }
                 let st = self.voiceBuffer.state()
                 guard st.hasSpeech else { continue }
-                if st.silence > 1.2 || st.duration > 28 {
+                if st.silence > 0.85 || st.duration > 28 {
                     let samples = self.voiceBuffer.snapshot()
                     self.voiceBuffer.reset()
                     lastInterimDuration = 0
@@ -393,7 +481,8 @@ final class TranscriptionEngine: ObservableObject {
                     if st.duration - st.silence > 0.35 {
                         await self.whisperTranscribe(samples, with: wk, final: true)
                     }
-                } else if st.duration > 1.0, st.duration - lastInterimDuration > 0.5 {
+                } else if st.silence < 0.4, st.duration > 1.0, st.duration - lastInterimDuration > 0.8 {
+                    // 仅在用户仍在说话时跑临时稿，避免临时识别占住引擎、拖慢定稿
                     lastInterimDuration = st.duration
                     await self.whisperTranscribe(self.voiceBuffer.snapshot(), with: wk, final: false)
                 }
@@ -411,12 +500,14 @@ final class TranscriptionEngine: ObservableObject {
             }
         }
         let lang = utteranceLang ?? "zh"
+        // withoutTimestamps：单窗口语句不需要时间戳 token，省 20-30% 解码时间
         let options = DecodingOptions(
             task: .transcribe,
             language: lang,
             temperature: 0,
             detectLanguage: false,
-            skipSpecialTokens: true
+            skipSpecialTokens: true,
+            withoutTimestamps: true
         )
         let results: [TranscriptionResult]
         do {
@@ -438,6 +529,9 @@ final class TranscriptionEngine: ObservableObject {
 
     func stop() async {
         guard isRunning else { return }
+        configRestoreTask?.cancel()
+        configRestoreTask = nil
+        rebuildTap = nil
         speaker.stop()
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
@@ -464,6 +558,9 @@ final class TranscriptionEngine: ObservableObject {
         }
         isRunning = false
         audioLevel = 0
+        #if os(iOS)
+        deactivateAudioSession()
+        #endif
         status = "已停止"
     }
 
@@ -552,11 +649,15 @@ final class TranscriptionEngine: ObservableObject {
         return lines.joined(separator: "\n") + "\n"
     }
 
+    nonisolated static var transcriptsDirectory: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("实时转录", isDirectory: true)
+    }
+
     @discardableResult
     func saveMarkdown() -> URL? {
         guard !segments.isEmpty else { return nil }
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("实时转录", isDirectory: true)
+        let dir = Self.transcriptsDirectory
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let df = DateFormatter()
