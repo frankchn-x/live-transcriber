@@ -380,7 +380,9 @@ struct ContentView: View {
 
     private var recordButton: some View {
         Button {
-            if engine.isRunning {
+            if engine.isPreparing {
+                return
+            } else if engine.isRunning {
                 Task {
                     await engine.stop()
                     savedURL = engine.saveMarkdown()
@@ -403,11 +405,17 @@ struct ContentView: View {
                     .frame(width: 54, height: 54)
                     .shadow(color: engine.isRunning ? .red.opacity(0.45) : .blue.opacity(0.35),
                             radius: engine.isRunning ? 12 : 8, y: 2)
-                Image(systemName: engine.isRunning ? "stop.fill" : "mic.fill")
-                    .font(.system(size: 19, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .opacity(engine.isPreparing ? 0.5 : 1)
+                if engine.isPreparing {
+                    ProgressView().controlSize(.small).tint(.white)
+                } else {
+                    Image(systemName: engine.isRunning ? "stop.fill" : "mic.fill")
+                        .font(.system(size: 19, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
             }
         }
+        .disabled(engine.isPreparing)
         .buttonStyle(.plain)
         .help(engine.isRunning ? "停止并保存" : "开始转录")
     }

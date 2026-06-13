@@ -159,6 +159,7 @@ final class TranscriptionEngine: ObservableObject {
     @Published var sessionStart: Date?
     @Published var downloadProgress: Double?
     @Published var audioLevel: Double = 0
+    @Published var isPreparing = false   // 下载/加载模型中，防止重复点击重入
 
     private let audioEngine = AVAudioEngine()
     private var analyzer: SpeechAnalyzer?
@@ -236,7 +237,9 @@ final class TranscriptionEngine: ObservableObject {
     }
 
     func start(localeID: String, backend: Backend) async {
-        guard !isRunning else { return }
+        guard !isRunning, !isPreparing else { return }
+        isPreparing = true
+        defer { isPreparing = false }
         self.backend = backend
         segments = []
         volatileText = ""
@@ -385,13 +388,21 @@ final class TranscriptionEngine: ObservableObject {
         #endif
     }
 
-    nonisolated static var whisperModelDownloaded: Bool {
-        let folder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    nonisolated static var whisperModelFolder: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("huggingface/models/argmaxinc/whisperkit-coreml/openai_whisper-\(whisperVariant)")
-        return FileManager.default.fileExists(atPath: folder.appendingPathComponent("TextDecoder.mlmodelc").path)
+    }
+
+    nonisolated static var whisperModelDownloaded: Bool {
+        FileManager.default.fileExists(atPath: whisperModelFolder.appendingPathComponent("TextDecoder.mlmodelc").path)
     }
 
     private func downloadWhisperModel() async throws {
+        // 清理上次中断留下的残缺下载，避免加载到坏文件
+        let folder = Self.whisperModelFolder
+        if FileManager.default.fileExists(atPath: folder.path), !Self.whisperModelDownloaded {
+            try? FileManager.default.removeItem(at: folder)
+        }
         downloadProgress = 0
         defer { downloadProgress = nil }
         let onProgress: (Progress) -> Void = { [weak self] p in

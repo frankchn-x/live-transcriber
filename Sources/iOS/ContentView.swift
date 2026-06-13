@@ -200,7 +200,9 @@ struct ContentView: View {
 
     private var recordButton: some View {
         Button {
-            if engine.isRunning {
+            if engine.isPreparing {
+                return   // 下载/加载中，忽略点击
+            } else if engine.isRunning {
                 Task {
                     await engine.stop()
                     savedURL = engine.saveMarkdown()
@@ -220,12 +222,20 @@ struct ContentView: View {
                         : AnyShapeStyle(brandGradient))
                     .frame(width: 66, height: 66)
                     .shadow(color: engine.isRunning ? .red.opacity(0.45) : .blue.opacity(0.35), radius: 12, y: 2)
-                Image(systemName: engine.isRunning ? "stop.fill" : "mic.fill")
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .opacity(engine.isPreparing ? 0.5 : 1)
+                if engine.isPreparing {
+                    ProgressView()
+                        .controlSize(.large)
+                        .tint(.white)
+                } else {
+                    Image(systemName: engine.isRunning ? "stop.fill" : "mic.fill")
+                        .font(.system(size: 24, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
             }
         }
         .buttonStyle(.plain)
+        .disabled(engine.isPreparing)
     }
 
     // MARK: - 逻辑
