@@ -1,4 +1,0 @@
-module yyjson {
-umbrella header "/Users/frank/Library/Developer/Xcode/DerivedData/LiveTranscriberiOS-gcgmaoqudfarfaggzpakgsaqmpqc/SourcePackages/checkouts/yyjson/src/yyjson.h"
-export *
-}
