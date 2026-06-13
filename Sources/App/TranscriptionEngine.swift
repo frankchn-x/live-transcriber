@@ -379,7 +379,7 @@ final class TranscriptionEngine: ObservableObject {
     // iPhone 用量化版（更小、编译更快、内存占用更低）；Mac 用完整版
     nonisolated static var whisperVariant: String {
         #if os(iOS)
-        return "large-v3_turbo_954"
+        return "large-v3_turbo_954MB"   // 仓库实际文件夹 openai_whisper-large-v3_turbo_954MB
         #else
         return "large-v3_turbo"
         #endif
